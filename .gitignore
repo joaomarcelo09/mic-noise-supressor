@@ -1,0 +1,7 @@
+.team/
+build/
+*.o
+*.so
+plugin/test_plugin
+__pycache__/
+*.pyc

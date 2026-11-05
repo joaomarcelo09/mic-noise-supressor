@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""
+cleanmic - CLI management tool for Clean Mic PipeWire filter-chain service.
+
+Part of Clean Mic.
+"""
+
+import sys
+import os
+import json
+import subprocess
+import time
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "cleanmic"
+SETTINGS_PATH = CONFIG_DIR / "settings.json"
+CONF_PATH = CONFIG_DIR / "clean-mic.conf"
+CONF_IN_PATH = CONFIG_DIR / "clean-mic.conf.in"
+SERVICE_NAME = "clean-mic.service"
+
+DEFAULT_TEMPLATE = """# Clean Mic PipeWire Filter-Chain Configuration
+# Template file: processed by `cleanmic apply` to generate ~/.config/cleanmic/clean-mic.conf
+
+context.properties = {
+    log.level = 0
+}
+
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+
+context.modules = [
+    { name = libpipewire-module-rt
+        flags = [ ifexists nofail ]
+    }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-filter-chain
+        args = {
+            node.description = "Clean Mic"
+            media.name       = "Clean Mic"
+            filter.graph = {
+                nodes = [
+                    {
+                        type    = builtin
+                        name    = hp
+                        label   = bq_highpass
+                        control = { "Freq" = 80.0 }
+                    }
+                    {
+                        type    = ladspa
+                        name    = rnnoise
+                        plugin  = "librnnoise_gate_ladspa"
+                        label   = rnnoise_gate
+                        control = {
+                            "Suppression"     = @SUPPRESSION@
+                            "Gate Enable"     = @GATE_ENABLE@
+                            "VAD Threshold"   = @VAD_THRESHOLD@
+                            "Gate Release ms" = @GATE_RELEASE_MS@
+                            "Floor dB"        = @FLOOR_DB@
+                        }
+                    }
+                ]
+                links = [
+                    { output = "hp:Out" input = "rnnoise:Input" }
+                ]
+                inputs  = [ "hp:In" ]
+                outputs = [ "rnnoise:Output" ]
+            }
+            capture.props = {
+                node.name     = "capture.clean_mic"
+                node.passive  = true
+                target.object = "@SOURCE@"
+            }
+            playback.props = {
+                node.name        = "clean_mic"
+                node.description = "Clean Mic"
+                media.class      = "Audio/Source"
+            }
+        }
+    }
+]
+"""
+
+DEFAULT_SETTINGS = {
+    "source": "",
+    "suppression": 1.0,
+    "gate_enable": 1,
+    "vad_threshold": 0.6,
+    "release_ms": 200.0,
+    "floor_db": -80.0
+}
+
+
+def get_real_sources(detailed: bool = False):
+    """Return real microphone input sources, excluding clean_mic and monitors."""
+    sources = []
+    # Try pactl -f json list sources
+    try:
+        res = subprocess.run(
+            ["pactl", "-f", "json", "list", "sources"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        data = json.loads(res.stdout)
+        for s in data:
+            name = s.get("name", "")
+            if not name or "clean_mic" in name or name.endswith(".monitor") or '"' in name or '\\' in name:
+                continue
+            if s.get("monitor_source"):
+                continue
+            if s.get("properties", {}).get("device.class") == "monitor":
+                continue
+            desc = s.get("description", name)
+            if detailed:
+                sources.append({"name": name, "description": desc})
+            else:
+                sources.append(name)
+        if sources:
+            return sources
+    except Exception:
+        pass
+
+    # Fallback to pactl list short sources
+    try:
+        res = subprocess.run(
+            ["pactl", "list", "short", "sources"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        for line in res.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                name = parts[1]
+                if not name or "clean_mic" in name or name.endswith(".monitor") or '"' in name or '\\' in name:
+                    continue
+                if detailed:
+                    sources.append({"name": name, "description": name})
+                else:
+                    sources.append(name)
+        if sources:
+            return sources
+    except Exception:
+        pass
+
+    # Fallback to pw-dump Node
+    try:
+        res = subprocess.run(
+            ["pw-dump", "Node"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        data = json.loads(res.stdout)
+        for node in data:
+            props = node.get("info", {}).get("props", {})
+            media_class = props.get("media.class", "")
+            name = props.get("node.name", "")
+            if media_class == "Audio/Source":
+                if not name or "clean_mic" in name or name.endswith(".monitor") or '"' in name or '\\' in name:
+                    continue
+                desc = props.get("node.description", name)
+                if detailed:
+                    sources.append({"name": name, "description": desc})
+                else:
+                    sources.append(name)
+    except Exception:
+        pass
+
+    return sources
+
+
+def is_valid_source(source, real_sources: list = None) -> bool:
+    """Return True if source is a valid real microphone source name."""
+    if not source or not isinstance(source, str):
+        return False
+    if '"' in source or '\\' in source:
+        return False
+    if "clean_mic" in source or source.endswith(".monitor"):
+        return False
+    if real_sources is None:
+        real_sources = get_real_sources(detailed=False)
+    return source in real_sources
+
+
+def detect_default_source(real_sources: list = None) -> str:
+    """Detect the current default microphone source, ensuring it is a valid real source."""
+    if real_sources is None:
+        real_sources = get_real_sources(detailed=False)
+
+    try:
+        res = subprocess.run(
+            ["pactl", "get-default-source"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        src = res.stdout.strip()
+        if src in real_sources:
+            return src
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(
+            ["pactl", "info"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        for line in res.stdout.splitlines():
+            if line.startswith("Default Source:"):
+                src = line.split(":", 1)[1].strip()
+                if src in real_sources:
+                    return src
+    except Exception:
+        pass
+
+    if real_sources:
+        return real_sources[0]
+    return ""
+
+
+def get_current_default_source() -> str:
+    """Get the current PipeWire/PulseAudio default input source."""
+    try:
+        res = subprocess.run(
+            ["pactl", "get-default-source"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return res.stdout.strip()
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(
+            ["pactl", "info"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        for line in res.stdout.splitlines():
+            if line.startswith("Default Source:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def restore_default_source(settings: dict = None) -> bool:
+    """Restore the default input source to default_restore or fallback."""
+    if settings is None:
+        settings = load_settings(validate_source=False)
+    real_sources = get_real_sources(detailed=False)
+    restore_src = settings.get("default_restore")
+    if not restore_src or not is_valid_source(restore_src, real_sources):
+        src = settings.get("source")
+        if is_valid_source(src, real_sources):
+            restore_src = src
+        else:
+            restore_src = detect_default_source(real_sources)
+    if restore_src:
+        res = subprocess.run(["pactl", "set-default-source", restore_src], capture_output=True, text=True)
+        return res.returncode == 0
+    return False
+
+
+def load_settings(validate_source: bool = True) -> dict:
+    """Load settings from JSON, filling in defaults if missing."""
+    settings = dict(DEFAULT_SETTINGS)
+    if SETTINGS_PATH.is_file():
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    settings.update(data)
+        except Exception as e:
+            sys.stderr.write(f"Warning: failed to read {SETTINGS_PATH}: {e}\n")
+
+    if validate_source:
+        real_sources = get_real_sources(detailed=False)
+        source = settings.get("source")
+        if not source:
+            settings["source"] = detect_default_source(real_sources)
+        elif not is_valid_source(source, real_sources):
+            default_src = detect_default_source(real_sources)
+            sys.stderr.write(
+                f"Warning: invalid source '{source}' in settings; falling back to default source '{default_src}'.\n"
+            )
+            settings["source"] = default_src
+
+    return settings
+
+
+def save_settings(settings: dict) -> None:
+    """Save settings dictionary to settings.json."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+
+
+def generate_conf(settings: dict) -> str:
+    """Generate clean-mic.conf content from template and settings."""
+    template = DEFAULT_TEMPLATE
+    if CONF_IN_PATH.is_file():
+        try:
+            template = CONF_IN_PATH.read_text(encoding="utf-8")
+        except Exception:
+            pass
+
+    real_sources = get_real_sources(detailed=False)
+    source = settings.get("source", "")
+    if not source:
+        source = detect_default_source(real_sources)
+        settings["source"] = source
+    elif not is_valid_source(source, real_sources):
+        default_src = detect_default_source(real_sources)
+        sys.stderr.write(
+            f"Warning: invalid source '{source}'; falling back to default real source '{default_src}'.\n"
+        )
+        source = default_src
+        settings["source"] = source
+
+    safe_source = str(source).replace('"', '').replace('\\', '')
+
+    suppression = float(settings.get("suppression", 1.0))
+    gate_enable = 1 if settings.get("gate_enable", 1) in (1, "1", True, "true") else 0
+    vad_threshold = float(settings.get("vad_threshold", 0.6))
+    release_ms = float(settings.get("release_ms", 200.0))
+    floor_db = float(settings.get("floor_db", -80.0))
+
+    conf = template.replace("@SOURCE@", safe_source)
+    conf = conf.replace("@SUPPRESSION@", f"{suppression:.4f}")
+    conf = conf.replace("@GATE_ENABLE@", f"{gate_enable}")
+    conf = conf.replace("@VAD_THRESHOLD@", f"{vad_threshold:.4f}")
+    conf = conf.replace("@GATE_RELEASE_MS@", f"{release_ms:.1f}")
+    conf = conf.replace("@FLOOR_DB@", f"{floor_db:.1f}")
+
+    return conf
+
+
+def is_service_active() -> bool:
+    """Check if clean-mic.service is active."""
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", SERVICE_NAME],
+            capture_output=True,
+            text=True
+        )
+        return res.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def is_node_present() -> bool:
+    """Check if clean_mic source node is present in PipeWire / PulseAudio."""
+    try:
+        res = subprocess.run(
+            ["pactl", "list", "short", "sources"],
+            capture_output=True,
+            text=True
+        )
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "clean_mic":
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def cmd_status() -> int:
+    """Print service and node status as JSON."""
+    active = is_service_active()
+    node_present = is_node_present()
+    settings = load_settings()
+    source = settings.get("source", "")
+    curr_def = get_current_default_source()
+    is_def = (curr_def == "clean_mic")
+
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", SERVICE_NAME],
+            capture_output=True,
+            text=True
+        )
+        state_str = res.stdout.strip()
+    except Exception:
+        state_str = "inactive"
+
+    status = {
+        "service_active": active,
+        "active": active,
+        "service": state_str,
+        "source": source,
+        "node_present": node_present,
+        "clean_mic_present": node_present,
+        "is_default": is_def,
+        "default": is_def,
+        "current_default_source": curr_def,
+        "default_restore": settings.get("default_restore", ""),
+        "settings": settings
+    }
+    print(json.dumps(status, indent=2))
+    return 0
+
+
+def cmd_sources(args: list) -> int:
+    """Print real microphone sources as JSON list."""
+    detailed = "--detailed" in args or "-v" in args
+    sources = get_real_sources(detailed=detailed)
+    print(json.dumps(sources, indent=2))
+    return 0
+
+
+def cmd_start() -> int:
+    """Start clean-mic.service via systemctl --user."""
+    subprocess.run(["systemctl", "--user", "reset-failed", SERVICE_NAME], capture_output=True)
+    if not CONF_PATH.is_file():
+        settings = load_settings()
+        conf = generate_conf(settings)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONF_PATH.write_text(conf, encoding="utf-8")
+    res = subprocess.run(["systemctl", "--user", "start", SERVICE_NAME])
+    return res.returncode
+
+
+def cmd_stop() -> int:
+    """Stop clean-mic.service via systemctl --user."""
+    curr = get_current_default_source()
+    if curr == "clean_mic":
+        restore_default_source()
+    res = subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME])
+    return res.returncode
+
+
+def cmd_restart() -> int:
+    """Restart clean-mic.service via systemctl --user."""
+    subprocess.run(["systemctl", "--user", "reset-failed", SERVICE_NAME], capture_output=True)
+    if not CONF_PATH.is_file():
+        settings = load_settings()
+        conf = generate_conf(settings)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONF_PATH.write_text(conf, encoding="utf-8")
+    res = subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME])
+    return res.returncode
+
+
+def cmd_enable() -> int:
+    """Enable clean-mic.service via systemctl --user."""
+    res = subprocess.run(["systemctl", "--user", "enable", SERVICE_NAME])
+    return res.returncode
+
+
+def cmd_disable() -> int:
+    """Disable clean-mic.service via systemctl --user."""
+    res = subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME])
+    return res.returncode
+
+
+def cmd_get(args: list) -> int:
+    """Get all settings or a specific setting key."""
+    settings = load_settings()
+    if not args:
+        print(json.dumps(settings, indent=2))
+        return 0
+
+    key = args[0]
+    if key not in settings:
+        sys.stderr.write(f"Error: unknown setting key '{key}'. Valid keys: {list(settings.keys())}\n")
+        return 1
+
+    val = settings[key]
+    print(val)
+    return 0
+
+
+def cmd_set(args: list) -> int:
+    """Set a setting key to a validated value."""
+    if len(args) < 2:
+        sys.stderr.write("Usage: cleanmic set <key> <value>\n")
+        return 1
+
+    key = args[0]
+    raw_val = args[1]
+    # For keys other than source, do not overwrite unplugged source with fallback
+    settings = load_settings(validate_source=(key == "source"))
+
+    valid_keys = list(DEFAULT_SETTINGS.keys()) + ["default_restore"]
+    if key not in settings and key not in valid_keys:
+        sys.stderr.write(f"Error: unknown setting key '{key}'. Valid keys: {valid_keys}\n")
+        return 1
+
+    if key == "source":
+        real_sources = get_real_sources(detailed=False)
+        if not is_valid_source(raw_val, real_sources):
+            sys.stderr.write(f"Error: invalid source '{raw_val}'. Must be one of: {real_sources}\n")
+            return 1
+        settings["source"] = raw_val
+
+    elif key == "suppression":
+        try:
+            v = float(raw_val)
+            if not (0.0 <= v <= 1.0):
+                raise ValueError("Suppression must be between 0.0 and 1.0")
+            settings["suppression"] = v
+        except ValueError as e:
+            sys.stderr.write(f"Error: {e}\n")
+            return 1
+
+    elif key == "gate_enable":
+        if raw_val.lower() in ("1", "true", "yes", "on"):
+            settings["gate_enable"] = 1
+        elif raw_val.lower() in ("0", "false", "no", "off"):
+            settings["gate_enable"] = 0
+        else:
+            sys.stderr.write("Error: gate_enable must be 0 or 1\n")
+            return 1
+
+    elif key == "vad_threshold":
+        try:
+            v = float(raw_val)
+            if not (0.0 <= v <= 1.0):
+                raise ValueError("vad_threshold must be between 0.0 and 1.0")
+            settings["vad_threshold"] = v
+        except ValueError as e:
+            sys.stderr.write(f"Error: {e}\n")
+            return 1
+
+    elif key == "release_ms":
+        try:
+            v = float(raw_val)
+            if not (20.0 <= v <= 1000.0):
+                raise ValueError("release_ms must be between 20.0 and 1000.0")
+            settings["release_ms"] = v
+        except ValueError as e:
+            sys.stderr.write(f"Error: {e}\n")
+            return 1
+
+    elif key == "floor_db":
+        try:
+            v = float(raw_val)
+            if not (-80.0 <= v <= 0.0):
+                raise ValueError("floor_db must be between -80.0 and 0.0")
+            settings["floor_db"] = v
+        except ValueError as e:
+            sys.stderr.write(f"Error: {e}\n")
+            return 1
+
+    elif key == "default_restore":
+        settings["default_restore"] = raw_val
+
+    save_settings(settings)
+    return 0
+
+
+def cmd_apply(restart: bool = True) -> int:
+    """Regenerate clean-mic.conf from settings and restart the service if requested."""
+    settings = load_settings(validate_source=True)
+
+    conf = generate_conf(settings)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONF_PATH.write_text(conf, encoding="utf-8")
+
+    if restart:
+        subprocess.run(["systemctl", "--user", "reset-failed", SERVICE_NAME], capture_output=True)
+        res = subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME])
+        return res.returncode
+    return 0
+
+
+def cmd_default(args: list) -> int:
+    """Manage Clean Mic as default microphone: on|off|status."""
+    if not args:
+        sys.stderr.write("Usage: cleanmic default <on|off|status>\n")
+        return 1
+
+    action = args[0]
+    settings = load_settings(validate_source=False)
+
+    if action == "on":
+        if not is_service_active():
+            ret = cmd_start()
+            if ret != 0:
+                sys.stderr.write("Error: failed to start clean-mic.service\n")
+                return ret
+        for _ in range(30):
+            if is_node_present():
+                break
+            time.sleep(0.1)
+
+        curr = get_current_default_source()
+        if curr and curr != "clean_mic":
+            settings["default_restore"] = curr
+            save_settings(settings)
+
+        res = subprocess.run(["pactl", "set-default-source", "clean_mic"], capture_output=True, text=True)
+        if res.returncode != 0:
+            sys.stderr.write(f"Error setting default source to clean_mic: {res.stderr}\n")
+            return res.returncode
+        print("Clean Mic is now the default microphone.")
+        return 0
+
+    elif action == "off":
+        if not restore_default_source(settings):
+            sys.stderr.write("Warning: could not find a valid real source to restore default.\n")
+            return 1
+        curr = get_current_default_source()
+        print(f"Default microphone restored to: {curr}")
+        return 0
+
+    elif action == "status":
+        curr = get_current_default_source()
+        is_def = (curr == "clean_mic")
+        if "--json" in args:
+            print(json.dumps({
+                "default": is_def,
+                "current_default_source": curr,
+                "default_restore": settings.get("default_restore", "")
+            }, indent=2))
+        else:
+            print("on" if is_def else "off")
+        return 0
+
+    else:
+        sys.stderr.write(f"Error: unknown default action '{action}'. Valid actions: on, off, status\n")
+        return 1
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write(
+            "Usage: cleanmic <status|sources|start|stop|restart|enable|disable|get|set|apply|default|generate-conf> [args...]\n"
+        )
+        return 1
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd == "status":
+        return cmd_status()
+    elif cmd == "sources":
+        return cmd_sources(args)
+    elif cmd == "start":
+        return cmd_start()
+    elif cmd == "stop":
+        return cmd_stop()
+    elif cmd == "restart":
+        return cmd_restart()
+    elif cmd == "enable":
+        return cmd_enable()
+    elif cmd == "disable":
+        return cmd_disable()
+    elif cmd == "get":
+        return cmd_get(args)
+    elif cmd == "set":
+        return cmd_set(args)
+    elif cmd == "apply":
+        restart = "--no-restart" not in args
+        return cmd_apply(restart=restart)
+    elif cmd == "default":
+        return cmd_default(args)
+    elif cmd in ("generate-conf", "generate_conf"):
+        return cmd_apply(restart=False)
+    else:
+        sys.stderr.write(f"Error: unknown command '{cmd}'\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

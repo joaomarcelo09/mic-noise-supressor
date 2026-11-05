@@ -1,0 +1,15 @@
+[Unit]
+Description=Clean Mic noise suppression and VAD gate service
+PartOf=pipewire.service
+After=pipewire.service wireplumber.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=LADSPA_PATH=%h/.local/lib/cleanmic:/usr/lib64/ladspa:/usr/lib/ladspa:/usr/lib
+ExecStart=/usr/bin/pipewire -c %h/.config/cleanmic/clean-mic.conf
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=default.target

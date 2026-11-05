@@ -1,0 +1,64 @@
+# Clean Mic PipeWire Filter-Chain Configuration
+# Template file: processed by `cleanmic apply` to generate ~/.config/cleanmic/clean-mic.conf
+
+context.properties = {
+    log.level = 0
+}
+
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+
+context.modules = [
+    { name = libpipewire-module-rt
+        flags = [ ifexists nofail ]
+    }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-filter-chain
+        args = {
+            node.description = "Clean Mic"
+            media.name       = "Clean Mic"
+            filter.graph = {
+                nodes = [
+                    {
+                        type    = builtin
+                        name    = hp
+                        label   = bq_highpass
+                        control = { "Freq" = 80.0 }
+                    }
+                    {
+                        type    = ladspa
+                        name    = rnnoise
+                        plugin  = "librnnoise_gate_ladspa"
+                        label   = rnnoise_gate
+                        control = {
+                            "Suppression"     = @SUPPRESSION@
+                            "Gate Enable"     = @GATE_ENABLE@
+                            "VAD Threshold"   = @VAD_THRESHOLD@
+                            "Gate Release ms" = @GATE_RELEASE_MS@
+                            "Floor dB"        = @FLOOR_DB@
+                        }
+                    }
+                ]
+                links = [
+                    { output = "hp:Out" input = "rnnoise:Input" }
+                ]
+                inputs  = [ "hp:In" ]
+                outputs = [ "rnnoise:Output" ]
+            }
+            capture.props = {
+                node.name     = "capture.clean_mic"
+                node.passive  = true
+                target.object = "@SOURCE@"
+            }
+            playback.props = {
+                node.name        = "clean_mic"
+                node.description = "Clean Mic"
+                media.class      = "Audio/Source"
+            }
+        }
+    }
+]
