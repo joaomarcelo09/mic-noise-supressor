@@ -19,6 +19,23 @@
 
 #define RNNOISE_FRAME_SIZE 480
 
+/*
+ * Energy check for the gate. RNNoise's VAD alone is not reliable on loud,
+ * steady background noise (e.g. a high-gain USB mic): it can report voice
+ * probability > 0.9 on pure noise, which kept the gate open most of the time
+ * so the floor never applied. The gate therefore also requires the input frame
+ * energy to be clearly above a tracked noise floor.
+ */
+#define SPEECH_MARGIN_DB        9.0f   /* frame must exceed noise floor by this */
+#define NOISE_FALL_COEF         0.3f   /* fast tracking when energy drops */
+#define NOISE_RISE_DB_PER_SEC   1.0f   /* slow tracking when energy rises */
+#define NOISE_FLOOR_MIN_DB    -100.0f
+#define NOISE_SILENCE_DB       -90.0f  /* frames below this (digital silence, dropouts) do not update the tracker */
+#define NOISE_WINDOW_SEC         0.6f  /* the tracker never stays below the minimum of the last two windows */
+#define NOISE_WINDOW_EMPTY_DB 1000.0f  /* window minimum before any frame was seen */
+#define NOISE_FLOOR_INIT_DB      0.0f  /* start high; falls to the real floor in a few frames */
+#define FLOOR_DB_MIN           -80.0f  /* floor at this value means true mute (gain 0) */
+
 enum {
     PORT_INPUT           = 0,
     PORT_OUTPUT          = 1,
@@ -95,7 +112,82 @@ typedef struct {
     /* Gate dynamics */
     float         current_gain;
     unsigned long hold_samples;
+    float         noise_floor_db;
+    float         window_min_db;      /* minimum frame energy in the current window */
+    float         prev_window_min_db; /* minimum frame energy in the previous window */
+    float         window_elapsed_sec;
 } RNNoiseGatePlugin;
+
+static float frame_energy_db(const float *frame) {
+    double sum = 0.0;
+    for (int i = 0; i < RNNOISE_FRAME_SIZE; i++) {
+        float s = frame[i];
+        if (isnan(s) || isinf(s)) s = 0.0f;
+        sum += (double)s * (double)s;
+    }
+    float db = (float)(10.0 * log10(sum / RNNOISE_FRAME_SIZE + 1e-20));
+    return db < NOISE_FLOOR_MIN_DB ? NOISE_FLOOR_MIN_DB : db;
+}
+
+static void reset_noise_floor(RNNoiseGatePlugin *plugin) {
+    plugin->noise_floor_db = NOISE_FLOOR_INIT_DB;
+    plugin->window_min_db = NOISE_WINDOW_EMPTY_DB;
+    plugin->prev_window_min_db = NOISE_WINDOW_EMPTY_DB;
+    plugin->window_elapsed_sec = 0.0f;
+}
+
+/*
+ * Lift the tracker to the minimum energy seen over the last two windows
+ * (0.6-1.2 s). Speech has short pauses, so this minimum stays near the
+ * background, while a tracker pulled down by a dropout recovers in under 2 s.
+ */
+static void update_noise_window(RNNoiseGatePlugin *plugin, float energy_db, float frame_sec) {
+    int is_silent = (energy_db < NOISE_SILENCE_DB);
+    if (!is_silent && energy_db < plugin->window_min_db) {
+        plugin->window_min_db = energy_db;
+    }
+    plugin->window_elapsed_sec += frame_sec;
+    if (plugin->window_elapsed_sec < NOISE_WINDOW_SEC) {
+        return;
+    }
+
+    float recent_min_db = plugin->window_min_db;
+    if (plugin->prev_window_min_db < recent_min_db) {
+        recent_min_db = plugin->prev_window_min_db;
+    }
+    int seen_audio = (recent_min_db < NOISE_WINDOW_EMPTY_DB);
+    if (seen_audio && recent_min_db > plugin->noise_floor_db) {
+        plugin->noise_floor_db = recent_min_db;
+    }
+    plugin->prev_window_min_db = plugin->window_min_db;
+    plugin->window_min_db = NOISE_WINDOW_EMPTY_DB;
+    plugin->window_elapsed_sec = 0.0f;
+}
+
+/* Minimum-style tracker: follows drops quickly, rises slowly (so speech does not lift it). */
+static void update_noise_floor(RNNoiseGatePlugin *plugin, float energy_db, float frame_sec) {
+    update_noise_window(plugin, energy_db, frame_sec);
+
+    /* Digital silence says nothing about the background; skip it so the tracker never sinks to the clamp. */
+    if (energy_db < NOISE_SILENCE_DB) {
+        return;
+    }
+
+    float diff = energy_db - plugin->noise_floor_db;
+    if (diff < 0.0f) {
+        plugin->noise_floor_db += NOISE_FALL_COEF * diff;
+    } else {
+        float max_rise = NOISE_RISE_DB_PER_SEC * frame_sec;
+        plugin->noise_floor_db += diff < max_rise ? diff : max_rise;
+    }
+}
+
+static float floor_db_to_gain(float floor_db) {
+    if (floor_db <= FLOOR_DB_MIN) {
+        return 0.0f;
+    }
+    return powf(10.0f, floor_db / 20.0f);
+}
 
 static void process_rnnoise_frame(RNNoiseGatePlugin *plugin) {
     /* Read and clamp control inputs */
@@ -117,7 +209,7 @@ static void process_rnnoise_frame(RNNoiseGatePlugin *plugin) {
     float floor_db = plugin->port_floor_db ? *plugin->port_floor_db : plugin->default_floor_db;
     if (floor_db < -80.0f) floor_db = -80.0f;
     if (floor_db > 0.0f) floor_db = 0.0f;
-    float floor_gain = powf(10.0f, floor_db / 20.0f);
+    float floor_gain = floor_db_to_gain(floor_db);
 
     float sr = plugin->sample_rate > 0 ? (float)plugin->sample_rate : 48000.0f;
     float attack_rate = 1.0f / (0.005f * sr);  /* ~5 ms attack ramp */
@@ -143,7 +235,10 @@ static void process_rnnoise_frame(RNNoiseGatePlugin *plugin) {
         if (isnan(rnn_out[i]) || isinf(rnn_out[i])) rnn_out[i] = 0.0f;
     }
 
-    int voice_present = (vad_prob >= vad_thresh);
+    float energy_db = frame_energy_db(plugin->in_buf);
+    update_noise_floor(plugin, energy_db, RNNOISE_FRAME_SIZE / sr);
+    int above_noise = (energy_db >= plugin->noise_floor_db + SPEECH_MARGIN_DB);
+    int voice_present = (vad_prob >= vad_thresh) && above_noise;
     if (gate_enabled && voice_present) {
         plugin->hold_samples = full_hold;
     }
@@ -219,6 +314,7 @@ static LADSPA_Handle instantiate_rnnoise_gate(const LADSPA_Descriptor *descripto
 
     plugin->current_gain = powf(10.0f, -60.0f / 20.0f);
     plugin->hold_samples = 0;
+    reset_noise_floor(plugin);
     plugin->buf_pos = 0;
 
     return (LADSPA_Handle)plugin;
@@ -277,11 +373,12 @@ static void activate_rnnoise_gate(LADSPA_Handle instance) {
 
     float gate_enable = plugin->port_gate_enable ? *plugin->port_gate_enable : plugin->default_gate_enable;
     if (gate_enable > 0.5f) {
-        plugin->current_gain = powf(10.0f, floor_db / 20.0f);
+        plugin->current_gain = floor_db_to_gain(floor_db);
     } else {
         plugin->current_gain = 1.0f;
     }
     plugin->hold_samples = 0;
+    reset_noise_floor(plugin);
 }
 
 static void run_rnnoise_gate(LADSPA_Handle instance, unsigned long sample_count) {
