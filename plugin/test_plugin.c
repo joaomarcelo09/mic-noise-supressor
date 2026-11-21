@@ -115,6 +115,44 @@ static double calculate_rms(const float *buffer, int start, int end) {
     return sqrt(sum / (double)(end - start));
 }
 
+/*
+ * Feed a lead-in (digital zeros or a quiet dip), then a steady voice-like
+ * background at about bg_dbfs. Returns the output RMS in dBFS measured from
+ * 2 s after the background starts.
+ */
+static double run_lead_in_then_background(const LADSPA_Descriptor *desc, LADSPA_Handle inst,
+                                          float lead_in_db, float bg_dbfs) {
+    const int lead_in_samples = SAMPLE_RATE;          /* 1 s */
+    const int bg_samples = SAMPLE_RATE * 4;           /* 4 s */
+    const int measure_start = lead_in_samples + SAMPLE_RATE * 2;
+    const int total = lead_in_samples + bg_samples;
+    float *in = (float *)calloc((size_t)total, sizeof(float));
+    float *out = (float *)calloc((size_t)total, sizeof(float));
+    assert(in != NULL && out != NULL);
+
+    if (lead_in_db > -200.0f) {
+        generate_white_noise(in, lead_in_samples, lead_in_db);
+    }
+    /* The voice-like signal is about -11 dBFS before scaling */
+    float scale = powf(10.0f, (bg_dbfs + 11.0f) / 20.0f);
+    generate_voice_like_signal(in + lead_in_samples, bg_samples, 150.0f, -60.0f);
+    for (int i = lead_in_samples; i < total; i++) {
+        in[i] *= scale;
+    }
+
+    if (desc->activate) {
+        desc->activate(inst);
+    }
+    run_in_odd_blocks(desc, inst, in, out, total);
+
+    double in_db = 20.0 * log10(calculate_rms(in, measure_start, total) + 1e-12);
+    double out_db = 20.0 * log10(calculate_rms(out, measure_start, total) + 1e-12);
+    printf("  -> Background Input RMS: %.2f dBFS, Output RMS: %.2f dBFS\n", in_db, out_db);
+    free(in);
+    free(out);
+    return out_db;
+}
+
 int main(int argc, char **argv) {
     const char *so_path = (argc > 1) ? argv[1] : "./build/librnnoise_gate_ladspa.so";
     printf("Testing LADSPA plugin from: %s\n", so_path);
@@ -306,6 +344,79 @@ int main(int argc, char **argv) {
     assert(in_place_rms > 0.01);
     printf("  -> Assertion PASSED: in-place processing completed without distortion (RMS: %.2f dBFS).\n",
            20.0 * log10(in_place_rms + 1e-12));
+
+    /* --------------------------------------------------------------------- */
+    /* Test Case E: steady VAD-positive background is muted at floor -80 dB  */
+    /* --------------------------------------------------------------------- */
+    /*
+     * Regression: RNNoise's VAD can flag steady background noise as voice, which
+     * kept the gate open so the floor never applied. A constant-level harmonic
+     * background (high VAD, no level change) must be fully muted at -80 dB.
+     */
+    printf("\n[Test E] Steady voice-like background at constant low level, floor -80 dB...\n");
+    port_gate_enable = 1.0f;
+    port_floor_db = -80.0f;
+    if (desc->activate) {
+        desc->activate(inst);
+    }
+    generate_voice_like_signal(in_buf, TOTAL_SAMPLES, 150.0f, -60.0f);
+    for (int i = 0; i < TOTAL_SAMPLES; i++) {
+        in_buf[i] *= 0.02f; /* about -45 dBFS, like a hot USB mic's self-noise */
+    }
+    memset(out_buf, 0, sizeof(float) * TOTAL_SAMPLES);
+    run_in_odd_blocks(desc, inst, in_buf, out_buf, TOTAL_SAMPLES);
+
+    double in_rms_bg = calculate_rms(in_buf, settle_start, TOTAL_SAMPLES);
+    double out_rms_bg = calculate_rms(out_buf, settle_start, TOTAL_SAMPLES);
+    double out_db_bg = 20.0 * log10(out_rms_bg + 1e-12);
+    printf("  -> Background Input RMS: %.2f dBFS, Output RMS: %.2f dBFS\n",
+           20.0 * log10(in_rms_bg + 1e-12), out_db_bg);
+    assert(out_db_bg <= -80.0);
+    printf("  -> Assertion PASSED: steady background muted (<= -80 dBFS).\n");
+
+    /* Speech clearly above the background must still open the gate right away */
+    printf("[Test E2] Louder voice after the steady background...\n");
+    generate_voice_like_signal(in_buf, TOTAL_SAMPLES, 150.0f, -60.0f);
+    memset(out_buf, 0, sizeof(float) * TOTAL_SAMPLES);
+    run_in_odd_blocks(desc, inst, in_buf, out_buf, TOTAL_SAMPLES);
+    double out_rms_loud = calculate_rms(out_buf, settle_start, TOTAL_SAMPLES);
+    printf("  -> Voice Output RMS: %.2f dBFS\n", 20.0 * log10(out_rms_loud + 1e-12));
+    assert(out_rms_loud > 0.01);
+    printf("  -> Assertion PASSED: voice above background passes the gate.\n");
+
+    /* --------------------------------------------------------------------- */
+    /* Test Case F: noise tracker recovers after digital silence or a dip    */
+    /* --------------------------------------------------------------------- */
+    /*
+     * Regression: a run of digital zeros (startup, xrun, hardware mute) pulled
+     * the noise tracker down to the clamp, and its slow rise let a steady
+     * VAD-positive background through for about a minute afterwards.
+     */
+    static const float bg_levels_dbfs[] = { -57.0f, -45.0f };
+    for (int k = 0; k < 2; k++) {
+        printf("\n[Test F%d] Zeros, then steady background at %.0f dBFS, floor -80 dB...\n",
+               k + 1, bg_levels_dbfs[k]);
+        port_gate_enable = 1.0f;
+        port_floor_db = -80.0f;
+        double out_db = run_lead_in_then_background(desc, inst, -1000.0f, bg_levels_dbfs[k]);
+        assert(out_db <= -80.0);
+        printf("  -> Assertion PASSED: background muted within 2 s after silence.\n");
+    }
+
+    printf("\n[Test F3] Quiet -85 dBFS dip, then steady background at -45 dBFS, floor -80 dB...\n");
+    double out_db_dip = run_lead_in_then_background(desc, inst, -80.0f, -45.0f) /* about -85 dBFS RMS */;
+    assert(out_db_dip <= -80.0);
+    printf("  -> Assertion PASSED: background muted within 2 s after a quiet dip.\n");
+
+    /* Speech clearly above the background must still pass after the recovery */
+    printf("[Test F4] Louder voice after the recovered background...\n");
+    generate_voice_like_signal(in_buf, TOTAL_SAMPLES, 150.0f, -60.0f);
+    memset(out_buf, 0, sizeof(float) * TOTAL_SAMPLES);
+    run_in_odd_blocks(desc, inst, in_buf, out_buf, TOTAL_SAMPLES);
+    double out_rms_after = calculate_rms(out_buf, settle_start, TOTAL_SAMPLES);
+    printf("  -> Voice Output RMS: %.2f dBFS\n", 20.0 * log10(out_rms_after + 1e-12));
+    assert(out_rms_after > 0.01);
+    printf("  -> Assertion PASSED: voice above background passes the gate.\n");
 
     /* Cleanup */
     if (desc->deactivate) {

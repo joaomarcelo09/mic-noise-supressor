@@ -15,7 +15,16 @@ fi
 
 echo "==> Installing plugin to ~/.local/lib/cleanmic/..."
 mkdir -p "$HOME/.local/lib/cleanmic"
-install -m 755 "$PLUGIN_SO" "$HOME/.local/lib/cleanmic/librnnoise_gate_ladspa.so"
+INSTALLED_SO="$HOME/.local/lib/cleanmic/librnnoise_gate_ladspa.so"
+OLD_SO_SUM=""
+if [ -f "$INSTALLED_SO" ]; then
+    OLD_SO_SUM="$(sha256sum "$INSTALLED_SO" | cut -d' ' -f1)"
+fi
+install -m 755 "$PLUGIN_SO" "$INSTALLED_SO"
+PLUGIN_CHANGED=0
+if [ "$OLD_SO_SUM" != "$(sha256sum "$INSTALLED_SO" | cut -d' ' -f1)" ]; then
+    PLUGIN_CHANGED=1
+fi
 
 echo "==> Setting up configuration in ~/.config/cleanmic/..."
 mkdir -p "$HOME/.config/cleanmic"
@@ -121,12 +130,13 @@ echo "==> Reloading systemd user daemon..."
 systemctl --user daemon-reload
 
 # Restart the service only if it is already running from this HOME's unit and
-# the conf changed; never enable or start it here.
+# the conf or the plugin changed (a running process keeps the old plugin
+# loaded); never enable or start it here.
 UNIT_PATH="$HOME/.config/systemd/user/clean-mic.service"
-if [ "$CONF_CHANGED" = 1 ] \
+if { [ "$CONF_CHANGED" = 1 ] || [ "$PLUGIN_CHANGED" = 1 ]; } \
     && systemctl --user is-active --quiet clean-mic.service 2>/dev/null \
     && [ "$(systemctl --user show clean-mic.service -p FragmentPath --value 2>/dev/null)" = "$UNIT_PATH" ]; then
-    echo "==> Configuration changed; restarting running clean-mic.service..."
+    echo "==> Configuration or plugin changed; restarting running clean-mic.service..."
     systemctl --user reset-failed clean-mic.service 2>/dev/null || true
     systemctl --user restart clean-mic.service
 fi
